@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         番茄小说网页阅读增强
 // @namespace    https://github.com/xyz18950377305
-// @version      0.2.0
+// @version      0.3.0
 // @updateURL    https://raw.githubusercontent.com/xyz18950377305/fanqie-web-free-reader/main/fanqie-web-free-reader.user.js
 // @downloadURL  https://raw.githubusercontent.com/xyz18950377305/fanqie-web-free-reader/main/fanqie-web-free-reader.user.js
 // @description  在番茄小说网页版直接阅读完整正文，无需安装客户端
@@ -1154,9 +1154,11 @@
       return {
         api: saved && saved.api === 'batch' ? 'batch' : 'full',
         prefetch: !!(saved && saved.prefetch),
+        // 下载专用接口，独立于阅读接口；默认 batch（整本下载依赖批量能力）。
+        downloadApi: saved && saved.downloadApi === 'full' ? 'full' : 'batch',
       };
     } catch (_) {
-      return { api: 'full', prefetch: false };
+      return { api: 'full', prefetch: false, downloadApi: 'batch' };
     }
   }
 
@@ -1213,6 +1215,9 @@
       // next_item_id 供预加载定位下一章；章节末章时为空。
       nextItemId: String(novel.next_item_id || ''),
       bookId: String(novel.book_id || ''),
+      bookName: String(novel.book_name || ''),
+      author: String(novel.author || ''),
+      coverUrl: String(novel.thumb_url || ''),
     };
   }
 
@@ -1230,6 +1235,9 @@
       content: await decryptContent(content, device.secretKey),
       nextItemId: String(novel.next_item_id || ''),
       bookId: String(novel.book_id || ''),
+      bookName: String(novel.book_name || ''),
+      author: String(novel.author || ''),
+      coverUrl: String(novel.thumb_url || ''),
     };
   }
 
@@ -1316,6 +1324,910 @@
     }
   }
 
+  // ===== 下载 =====
+  // 单章：TXT / Markdown，直接用已取回的正文，无需额外请求。
+  // 整本：FB2 / EPUB，先取目录拿全部章节 ID，再按批请求。
+  //
+  // 整本下载是唯一真正用上 batch_full 多章能力的地方：一次 item_ids 可带
+  // 多章，减少往返。取不到的章节翻回队尾无限重排，直到成功或用户取消。
+
+  const DIRECTORY_URL = 'https://fanqienovel.com/api/reader/directory/detail?bookId=';
+  // 单次批量请求的章节数。上游硬上限为 30 章（见 BATCH_HARD_LIMIT），
+  // 这里取 10 留出余量，兼顾往返次数与稳定性。
+  const DOWNLOAD_BATCH_SIZE = 10;
+  const DOWNLOAD_RETRY = 3;         // 单章下载的重试次数（整本走无限重试）
+
+  // 已取回的正文，单章下载直接复用，避免重复请求。
+  const textCache = new Map();
+
+  function textCachePut(chapter) {
+    if (!chapter || !chapter.itemId || !chapter.content) return;
+    textCache.set(chapter.itemId, chapter);
+    while (textCache.size > 400) textCache.delete(textCache.keys().next().value);
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function escapeXml(text) {
+    return String(text)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+  }
+
+  function sanitizeFilename(name) {
+    return String(name || 'book')
+      .replace(/[\\/:*?"<>|]/g, '_')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 80) || 'book';
+  }
+
+  // ── ZIP（仅 store，不压缩；EPUB 允许）──
+
+  const CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      table[i] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32(bytes) {
+    let c = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  }
+
+  // files: [{ name, data: Uint8Array }]，按给定顺序写入。
+  // 注意：不能用 concatBytes(...parts) —— 章节数上万时 parts 长度可达数万，
+  // 展开运算符会撞上 V8 的参数个数上限（RangeError: Maximum call stack size
+  // exceeded）。这里改为预分配总长后逐段写入，与章数无关。
+  function makeZip(files) {
+    const localParts = [];   // { header, data }
+    const central = [];
+    let offset = 0;
+    let localSize = 0;
+
+    for (const file of files) {
+      const nameBytes = utf8Bytes(file.name);
+      const crc = crc32(file.data);
+      const size = file.data.length;
+      const local = new Uint8Array(30 + nameBytes.length);
+      const dv = new DataView(local.buffer);
+      dv.setUint32(0, 0x04034b50, true);
+      dv.setUint16(4, 20, true);
+      dv.setUint16(6, 0x0800, true);   // UTF-8 文件名
+      dv.setUint16(8, 0, true);        // 0 = store
+      dv.setUint16(10, 0, true);
+      dv.setUint16(12, 0, true);
+      dv.setUint32(14, crc, true);
+      dv.setUint32(18, size, true);
+      dv.setUint32(22, size, true);
+      dv.setUint16(26, nameBytes.length, true);
+      dv.setUint16(28, 0, true);
+      local.set(nameBytes, 30);
+      localParts.push({ header: local, data: file.data });
+      central.push({ nameBytes, crc, size, offset });
+      offset += local.length + size;
+      localSize += local.length + size;
+    }
+
+    const centralParts = [];
+    let centralSize = 0;
+    for (const item of central) {
+      const rec = new Uint8Array(46 + item.nameBytes.length);
+      const dv = new DataView(rec.buffer);
+      dv.setUint32(0, 0x02014b50, true);
+      dv.setUint16(4, 20, true);
+      dv.setUint16(6, 20, true);
+      dv.setUint16(8, 0x0800, true);
+      dv.setUint16(10, 0, true);
+      dv.setUint16(12, 0, true);
+      dv.setUint16(14, 0, true);
+      dv.setUint32(16, item.crc, true);
+      dv.setUint32(20, item.size, true);
+      dv.setUint32(24, item.size, true);
+      dv.setUint16(28, item.nameBytes.length, true);
+      dv.setUint32(42, item.offset, true);
+      rec.set(item.nameBytes, 46);
+      centralParts.push(rec);
+      centralSize += rec.length;
+    }
+
+    const end = new Uint8Array(22);
+    const dvEnd = new DataView(end.buffer);
+    dvEnd.setUint32(0, 0x06054b50, true);
+    dvEnd.setUint16(8, central.length, true);
+    dvEnd.setUint16(10, central.length, true);
+    dvEnd.setUint32(12, centralSize, true);
+    dvEnd.setUint32(16, offset, true);
+
+    // 预分配总长度，逐段写入，不依赖展开运算符。
+    const total = localSize + centralSize + end.length;
+    const out = new Uint8Array(total);
+    let pos = 0;
+    for (const part of localParts) {
+      out.set(part.header, pos); pos += part.header.length;
+      out.set(part.data, pos); pos += part.data.length;
+    }
+    for (const part of centralParts) {
+      out.set(part, pos); pos += part.length;
+    }
+    out.set(end, pos);
+    return out;
+  }
+
+  // ── 目录 ──
+
+  async function fetchDirectory(bookId) {
+    const response = await httpRequest(`${DIRECTORY_URL}${bookId}`);
+    if (response.status !== 200) throw new Error(`目录接口 HTTP ${response.status}`);
+    const payload = JSON.parse(utf8Decode(response.body));
+    const data = payload.data || {};
+    const chapters = [];
+    for (const volume of data.chapterListWithVolume || []) {
+      // 结构为 [[{itemId,title,volume_name}, ...], ...]，也兼容对象形式。
+      const list = Array.isArray(volume) ? volume : (volume.chapterList || []);
+      for (const chapter of list) {
+        const itemId = String(chapter.itemId || '');
+        if (!itemId) continue;
+        chapters.push({
+          itemId,
+          title: String(chapter.title || ''),
+          volume: String(chapter.volume_name || ''),
+        });
+      }
+    }
+    return chapters;
+  }
+
+  // ── 批量取正文 ──
+
+  // 上游 batch_full 单次最多返回 30 章：实测请求 29/30 章正常，31 章起
+  // 只返回前 30 章且不报错（静默截断）。因此调用方必须保证分片不超过此值，
+  // 否则超出部分会被当成「取不到」而无限重试。
+  const BATCH_HARD_LIMIT = 30;
+
+  // 把目录里的标题合并进章节对象。目录标题最可靠，接口标题仅作兜底。
+  function withMetaTitle(chapter, meta) {
+    return { ...chapter, title: (meta && meta.title) || chapter.title || '' };
+  }
+
+  // 一次请求取多章，返回 { itemId: chapter }，取不到的章节不出现在结果里。
+  async function fetchBatchMulti(itemIds, device) {
+    // 防御：超过上限直接截断会静默丢章，这里主动分片。
+    // 分片之间必须留间隔——连续快速请求会触发上游限流，表现为部分章节
+    // 在响应里缺失（实测连续请求 100 章会随机缺 30~60 章）。
+    if (itemIds.length > BATCH_HARD_LIMIT) {
+      const merged = {};
+      for (let i = 0; i < itemIds.length; i += BATCH_HARD_LIMIT) {
+        if (i > 0) await sleep(1200);
+        const part = itemIds.slice(i, i + BATCH_HARD_LIMIT);
+        Object.assign(merged, await fetchBatchMulti(part, device));
+      }
+      return merged;
+    }
+
+    const query = [...baseQuery(device), 'book_id=0', `item_ids=${itemIds.join(',')}`, 'req_type=1'].join('&');
+    const payload = await requestJson(BATCH_URL, query, device);
+    const data = payload.data || {};
+    const fetched = {};
+    for (const itemId of itemIds) {
+      const item = data[itemId] || {};
+      if (item.code && item.code !== 0) continue;
+      const content = String(item.content || '');
+      if (!content) continue;
+      try {
+        const novel = item.novel_data || {};
+        fetched[itemId] = {
+          itemId,
+          title: String(item.title || ''),
+          content: await decryptContent(content, device.secretKey),
+          nextItemId: String(novel.next_item_id || ''),
+          bookId: String(novel.book_id || ''),
+        };
+      } catch (_) {}
+    }
+    return fetched;
+  }
+
+  // 单章取正文，优先用缓存；失败重试。取消时立即中断重试。
+  async function fetchOneForDownload(itemId, device) {
+    const cached = textCache.get(itemId) || prefetchGet(itemId);
+    if (cached) return cached;
+    let lastError = null;
+    for (let attempt = 0; attempt < DOWNLOAD_RETRY; attempt++) {
+      checkCancelled();
+      try {
+        const chapter = await fetchByFull(itemId, device);
+        const full = { itemId, ...chapter };
+        textCachePut(full);
+        return full;
+      } catch (error) {
+        // 取消导致的异常直接上抛，不当作可重试失败。
+        if (error.message === '已取消') throw error;
+        lastError = error;
+        await sleep(800 * (attempt + 1));
+      }
+    }
+    throw lastError || new Error('取正文失败');
+  }
+
+  // 按下载接口取一批章节。
+  //   batch 走 batch_full，一次多章；单章失败交给外层队列重排，不在此重试。
+  //   full  逐章走单章接口。这里不做额外重试——失败直接跳过，由外层队列
+  //         统一重排，避免「内层 3 次 × 外层无限」把请求量放大。
+  async function fetchBatchByDownloadApi(itemIds, device, downloadApi) {
+    if (downloadApi !== 'full') return fetchBatchMulti(itemIds, device);
+    const fetched = {};
+    for (const itemId of itemIds) {
+      checkCancelled();
+      try {
+        fetched[itemId] = await fetchByFull(itemId, device);
+        fetched[itemId].itemId = itemId;
+      } catch (error) {
+        if (error.message === '已取消') throw error;
+        // 失败不在此重试，交给外层队列重排。
+      }
+    }
+    return fetched;
+  }
+
+  // ── 生成文件内容 ──
+
+  function chapterParagraphs(chapter) {
+    return htmlToLines(chapter.content);
+  }
+
+  function buildTxt(chapters, bookName) {
+    const blocks = [];
+    if (bookName) blocks.push(bookName, '');
+    chapters.forEach((chapter, index) => {
+      // 每章必须有自己的标题；接口未返回时按序号兜底。
+      blocks.push(chapter.title || `第 ${index + 1} 章`, '');
+      blocks.push(...chapterParagraphs(chapter), '');
+    });
+    return blocks.join('\n');
+  }
+
+  function buildMarkdown(chapters, bookName) {
+    const blocks = [];
+    if (bookName) blocks.push(`# ${bookName}`, '');
+    chapters.forEach((chapter, index) => {
+      blocks.push(`## ${chapter.title || `第 ${index + 1} 章`}`, '');
+      for (const line of chapterParagraphs(chapter)) blocks.push(line, '');
+    });
+    return blocks.join('\n');
+  }
+
+  // 取封面图：thumb_url 带签名可直接下载，失败不影响导出。
+  async function fetchCoverImage(url) {
+    if (!url) return null;
+    try {
+      const response = await httpRequest(url, { headers: { Accept: 'image/*' } });
+      if (response.status !== 200 || !response.body || !response.body.length) return null;
+      const bytes = response.body;
+      // 按魔数判断图片类型。
+      let ext = 'jpg';
+      if (bytes[0] === 0x89 && bytes[1] === 0x50) ext = 'png';
+      else if (bytes[0] === 0x47 && bytes[1] === 0x49) ext = 'gif';
+      else if (bytes[0] === 0x52 && bytes[1] === 0x49) ext = 'webp';
+      return { bytes, ext };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // FB2：作者、书名、封面都要有。封面以 <binary> base64 内嵌。
+  function buildFb2(chapters, bookName, author, cover) {
+    const authorBlock = `      <author>
+        <nickname>${escapeXml(author)}</nickname>
+      </author>`;
+
+    const coverBlock = cover
+      ? `      <coverpage>
+        <image l:href="#cover-image"/>
+      </coverpage>
+`
+      : '';
+
+    const coverBinary = cover
+      ? `  <binary id="cover-image" content-type="image/${cover.ext === 'jpg' ? 'jpeg' : cover.ext}">${bytesToBase64(cover.bytes)}</binary>
+`
+      : '';
+
+    const body = chapters.map((chapter, index) => {
+      // 每章必须有自己的标题；缺失时按序号兜底。
+      const chapterTitle = chapter.title || `第 ${index + 1} 章`;
+      const title = `    <title><p>${escapeXml(chapterTitle)}</p></title>\n`;
+      const paragraphs = chapterParagraphs(chapter)
+        .map((line) => `    <p>${escapeXml(line)}</p>`).join('\n');
+      return `  <section id="ch${index + 1}">\n${title}${paragraphs}\n  </section>`;
+    }).join('\n');
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink">
+  <description>
+    <title-info>
+      <book-title>${escapeXml(bookName)}</book-title>
+${authorBlock}
+${coverBlock}      <lang>zh</lang>
+    </title-info>
+    <document-info>
+      <program-used>fanqie-web-free-reader</program-used>
+    </document-info>
+  </description>
+  <body>
+    <title><p>${escapeXml(bookName)}</p></title>
+${body}
+  </body>
+${coverBinary}</FictionBook>
+`;
+  }
+
+  // EPUB：每章独立 XHTML 文件，含封面页、作者、书名。
+  function buildEpub(chapters, bookName, author, bookId, cover) {
+    const uid = `fq-${bookId || Date.now()}`;
+    const files = [];
+
+    // mimetype 必须是第一个条目且不压缩。
+    files.push({ name: 'mimetype', data: utf8Bytes('application/epub+zip') });
+    files.push({
+      name: 'META-INF/container.xml',
+      data: utf8Bytes(`<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>`),
+    });
+
+    const manifestItems = [];
+    const spineItems = [];
+    const navItems = [];
+
+    // 封面页作为第一个 spine 项。
+    if (cover) {
+      const coverFile = `cover.${cover.ext}`;
+      files.push({ name: `OEBPS/${coverFile}`, data: cover.bytes });
+      files.push({
+        name: 'OEBPS/cover.xhtml',
+        data: utf8Bytes(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-CN">
+<head><meta charset="utf-8"/><title>封面</title>
+<style>body{margin:0;padding:0;text-align:center;}img{max-width:100%;height:auto;}</style>
+</head>
+<body>
+  <div><img src="${coverFile}" alt="${escapeXml(bookName)}"/></div>
+</body>
+</html>`),
+      });
+      const mediaType = cover.ext === 'png' ? 'image/png'
+        : cover.ext === 'gif' ? 'image/gif'
+        : cover.ext === 'webp' ? 'image/webp' : 'image/jpeg';
+      manifestItems.push(`    <item id="cover-image" href="${coverFile}" media-type="${mediaType}" properties="cover-image"/>`);
+      manifestItems.push(`    <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>`);
+      spineItems.push(`    <itemref idref="cover" linear="yes"/>`);
+    }
+
+    // 书名页。
+    files.push({
+      name: 'OEBPS/titlepage.xhtml',
+      data: utf8Bytes(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-CN">
+<head><meta charset="utf-8"/><title>${escapeXml(bookName)}</title></head>
+<body>
+  <h1>${escapeXml(bookName)}</h1>
+  <p>作者：${escapeXml(author)}</p>
+</body>
+</html>`),
+    });
+    manifestItems.push(`    <item id="titlepage" href="titlepage.xhtml" media-type="application/xhtml+xml"/>`);
+    spineItems.push(`    <itemref idref="titlepage" linear="yes"/>`);
+
+    // 每章独立文件。
+    chapters.forEach((chapter, index) => {
+      const id = `ch${index + 1}`;
+      const href = `chapter${index + 1}.xhtml`;
+      const title = chapter.title || `第 ${index + 1} 章`;
+      const paragraphs = chapterParagraphs(chapter)
+        .map((line) => `    <p>${escapeXml(line)}</p>`).join('\n');
+
+      const xhtml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-CN">
+<head><meta charset="utf-8"/><title>${escapeXml(title)}</title></head>
+<body>
+  <h2>${escapeXml(title)}</h2>
+${paragraphs}
+</body>
+</html>`;
+
+      files.push({ name: `OEBPS/${href}`, data: utf8Bytes(xhtml) });
+      manifestItems.push(`    <item id="${id}" href="${href}" media-type="application/xhtml+xml"/>`);
+      spineItems.push(`    <itemref idref="${id}"/>`);
+      navItems.push(`      <li><a href="${href}">${escapeXml(title)}</a></li>`);
+    });
+
+    files.push({
+      name: 'OEBPS/nav.xhtml',
+      data: utf8Bytes(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="zh-CN">
+<head><meta charset="utf-8"/><title>目录</title></head>
+<body>
+  <nav epub:type="toc" id="toc">
+    <h1>目录</h1>
+    <ol>
+${navItems.join('\n')}
+    </ol>
+  </nav>
+</body>
+</html>`),
+    });
+
+    files.push({
+      name: 'OEBPS/toc.ncx',
+      data: utf8Bytes(`<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head><meta name="dtb:uid" content="${escapeXml(uid)}"/></head>
+  <docTitle><text>${escapeXml(bookName)}</text></docTitle>
+  <docAuthor><text>${escapeXml(author)}</text></docAuthor>
+  <navMap>
+${chapters.map((chapter, index) => `    <navPoint id="np${index + 1}" playOrder="${index + 1}">
+      <navLabel><text>${escapeXml(chapter.title || `第 ${index + 1} 章`)}</text></navLabel>
+      <content src="chapter${index + 1}.xhtml"/>
+    </navPoint>`).join('\n')}
+  </navMap>
+</ncx>`),
+    });
+
+    files.push({
+      name: 'OEBPS/content.opf',
+      data: utf8Bytes(`<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">${escapeXml(uid)}</dc:identifier>
+    <dc:title>${escapeXml(bookName)}</dc:title>
+    <dc:creator>${escapeXml(author)}</dc:creator>
+    <dc:language>zh-CN</dc:language>
+    <meta property="dcterms:modified">${new Date().toISOString().replace(/\.\d+Z$/, 'Z')}</meta>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+${manifestItems.join('\n')}
+  </manifest>
+  <spine toc="ncx">
+${spineItems.join('\n')}
+  </spine>
+</package>`),
+    });
+
+    return makeZip(files);
+  }
+
+  // ── 触发浏览器下载 ──
+
+  // 注意：不能固定 2 秒后 revokeObjectURL。整本导出可能是几十上百 MB，
+  // 浏览器写盘尚未完成就撤销 URL 会导致下载中断或得到 0 字节文件。
+  // 这里把 revoke 延后到较长时间，并先移除 <a> 节点。
+  function saveBlob(filename, bytes, mime) {
+    const blob = new Blob([bytes], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    // 60 秒后再释放，给大文件足够的落盘时间。
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  // ── 下载流程 ──
+
+  function setDownloadStatus(text) {
+    const node = document.getElementById('fq-dl-status');
+    if (node) node.textContent = text;
+  }
+
+  // 下载互斥锁：整本下载耗时且会连续发大量请求，重复触发会导致
+  // 多份任务并发跑同一本书，既浪费流量也容易触发风控。
+  // downloading 非空时所有下载入口直接忽略点击；cancelRequested 用于中途取消。
+  let downloading = '';
+  let cancelRequested = false;
+
+  function setDownloadButtonsDisabled(disabled) {
+    const panel = document.getElementById(DL_PANEL_ID);
+    if (!panel) return;
+    // 下载接口下拉框：下载中变灰不可选。
+    const apiSelect = panel.querySelector('#fq-dl-api');
+    if (apiSelect) {
+      apiSelect.disabled = disabled;
+      apiSelect.style.opacity = disabled ? '0.5' : '';
+      apiSelect.style.cursor = disabled ? 'not-allowed' : 'pointer';
+    }
+    for (const button of panel.querySelectorAll('button')) {
+      if (button.dataset.fqCancel === '1') {
+        // 取消按钮：下载中显示且可点，结束后直接隐藏，不留禁用态。
+        button.hidden = !disabled;
+        button.style.display = disabled ? '' : 'none';
+        button.disabled = !disabled;
+        button.style.opacity = '';
+        button.style.cursor = disabled ? 'pointer' : '';
+        continue;
+      }
+      button.disabled = disabled;
+      button.style.opacity = disabled ? '0.5' : '';
+      button.style.cursor = disabled ? 'not-allowed' : '';
+    }
+  }
+
+  function requestCancel() {
+    if (!downloading) return;
+    cancelRequested = true;
+    setDownloadStatus('正在取消…');
+    console.log(`${LOG} 已请求取消下载`);
+  }
+
+  // 在耗时循环里检查取消标记。
+  function checkCancelled() {
+    if (cancelRequested) throw new Error('已取消');
+  }
+
+  async function downloadSingleChapter(format) {
+    const itemId = getItemId();
+    if (!itemId) return;
+    if (downloading) {
+      setDownloadStatus(`正在下载中（${downloading}），请稍候`);
+      return;
+    }
+
+    downloading = `单章 ${format.toUpperCase()}`;
+    cancelRequested = false;
+    setDownloadButtonsDisabled(true);
+    try {
+      setDownloadStatus('正在获取当前章…');
+      const device = await ensureDevice();
+      const chapter = await fetchOneForDownload(itemId, device);
+      // 单章虽快，取消仍应立即生效，不再继续导出。
+      checkCancelled();
+      const title = chapter.title || itemId;
+      if (format === 'md') {
+        const text = buildMarkdown([chapter], '');
+        saveBlob(`${sanitizeFilename(title)}.md`, utf8Bytes(text), 'text/markdown;charset=utf-8');
+      } else {
+        const text = buildTxt([chapter], '');
+        saveBlob(`${sanitizeFilename(title)}.txt`, utf8Bytes(text), 'text/plain;charset=utf-8');
+      }
+      setDownloadStatus(`已下载：${title}`);
+      console.log(`${LOG} 单章下载完成（${format}）：${title}`);
+    } catch (error) {
+      if (error.message === '已取消') {
+        setDownloadStatus('已取消');
+      } else {
+        setDownloadStatus(`失败：${error.message}`);
+        console.warn(`${LOG} 单章下载失败：${error.message}`);
+      }
+    } finally {
+      downloading = '';
+      cancelRequested = false;
+      setDownloadButtonsDisabled(false);
+    }
+  }
+
+  async function downloadWholeBook(format) {
+    const itemId = getItemId();
+    if (!itemId) return;
+    if (downloading) {
+      setDownloadStatus(`正在下载中（${downloading}），请稍候`);
+      return;
+    }
+
+    downloading = `整本 ${format.toUpperCase()}`;
+    cancelRequested = false;
+    setDownloadButtonsDisabled(true);
+    try {
+      const device = await ensureDevice();
+
+      setDownloadStatus('正在获取目录…');
+      let bookId = currentBookId;
+      if (!bookId) {
+        const current = await fetchOneForDownload(itemId, device);
+        bookId = current.bookId || '';
+      }
+      if (!bookId) throw new Error('拿不到书籍 ID');
+
+      const chapters = await fetchDirectory(bookId);
+      if (!chapters.length) throw new Error('目录为空');
+      console.log(`${LOG} 目录共 ${chapters.length} 章，开始下载`);
+
+      // 先吃缓存，剩下需要请求的再进队列。
+      const collected = new Map();
+      const pending = [];
+      for (const meta of chapters) {
+        const cached = textCache.get(meta.itemId) || prefetchGet(meta.itemId);
+        if (cached) collected.set(meta.itemId, withMetaTitle(cached, meta));
+        else pending.push(meta);
+      }
+      setDownloadStatus(`目录 ${chapters.length} 章，已缓存 ${collected.size}，待取 ${pending.length}`);
+
+      // 统一队列 + 单一计数器：
+      //   attempted  每次尝试都 +1（无论成功失败）
+      //   total      初始为待取章数；某章失败并重新排队时 +1
+      // 失败章节无限重排（翻到队尾），直到成功或用户取消。
+      // 唯一退出方式是队列取空（全部成功）或 checkCancelled 抛错。
+      let attempted = 0;
+      let total = pending.length;
+      const queue = pending.slice();
+      let stalledRounds = 0;           // 连续无进展的轮数，用于加大退避
+      const downloadApi = loadSettings().downloadApi;
+
+      while (queue.length) {
+        checkCancelled();
+
+        const batch = queue.splice(0, DOWNLOAD_BATCH_SIZE);
+        const ids = batch.map((m) => m.itemId);
+
+        // 批次级重试：仅 batch 接口可能整批抛错；full 模式逐章容错，不会抛。
+        let fetched = {};
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            fetched = await fetchBatchByDownloadApi(ids, device, downloadApi);
+            break;
+          } catch (error) {
+            if (error.message === '已取消') throw error;
+            console.warn(`${LOG} 批量请求失败（第 ${attempt + 1} 次）：${error.message}`);
+            await sleep(1000 * (attempt + 1));
+          }
+        }
+
+        let batchSuccess = 0;
+        for (const meta of batch) {
+          // 取消后立即停止更新进度，不再刷 attempted/total 这类数字。
+          checkCancelled();
+          attempted++;
+          const chapter = fetched[meta.itemId];
+          if (chapter) {
+            const merged = withMetaTitle(chapter, meta);
+            textCachePut(merged);
+            collected.set(meta.itemId, merged);
+            batchSuccess++;
+          } else {
+            // 失败就翻到队尾，无限重试，直到成功或用户取消。
+            queue.push(meta);
+            total++;
+          }
+          // 只显示 attempted/total：失败时 total 增大而 attempted 未同步推进，
+          // 两者差距本身就是失败信号，无需额外文案。
+          setDownloadStatus(`${attempted}/${total}`);
+        }
+
+        // 整批无进展说明可能被限流，逐步加大退避，避免持续猛打。
+        if (batchSuccess === 0) {
+          stalledRounds++;
+          const wait = Math.min(30000, 1000 * Math.pow(2, Math.min(stalledRounds, 5)));
+          console.warn(`${LOG} 本轮无进展，等待 ${Math.round(wait / 1000)}s 后重试`);
+          await sleep(wait);
+        } else {
+          stalledRounds = 0;
+          await sleep(200);   // 轻微限速，避免触发风控
+        }
+      }
+
+      // 取消即终止：不导出残缺文件。
+      checkCancelled();
+
+      // 按目录顺序组装，仍缺的跳过并提示。
+      // 无限重试下，走到这里说明队列已取空，所有章节都已成功。
+      const ordered = chapters
+        .map((meta) => collected.get(meta.itemId))
+        .filter(Boolean);
+      if (!ordered.length) throw new Error('没有取到任何章节');
+
+      const bookName = currentBookName || `book_${bookId}`;
+      const author = currentAuthor || '佚名';
+
+      setDownloadStatus('正在获取封面…');
+      checkCancelled();
+      const cover = await fetchCoverImage(currentCoverUrl);
+      checkCancelled();
+
+      setDownloadStatus(`正在生成 ${format.toUpperCase()}…`);
+
+      if (format === 'fb2') {
+        const xml = buildFb2(ordered, bookName, author, cover);
+        saveBlob(`${sanitizeFilename(bookName)}.fb2`, utf8Bytes(xml), 'application/x-fictionbook+xml;charset=utf-8');
+      } else {
+        const zip = buildEpub(ordered, bookName, author, bookId, cover);
+        saveBlob(`${sanitizeFilename(bookName)}.epub`, zip, 'application/epub+zip');
+      }
+
+      setDownloadStatus(`已下载 ${ordered.length} 章`);
+      console.log(`${LOG} 整本下载完成（${format}）：${ordered.length} 章`);
+    } catch (error) {
+      if (error.message === '已取消') {
+        setDownloadStatus('已取消');
+        console.log(`${LOG} 整本下载已取消`);
+      } else {
+        setDownloadStatus(`失败：${error.message}`);
+        console.warn(`${LOG} 整本下载失败：${error.message}`);
+      }
+    } finally {
+      downloading = '';
+      cancelRequested = false;
+      setDownloadButtonsDisabled(false);
+    }
+  }
+
+  // ── 下载面板 ──
+
+  const DL_PANEL_ID = 'fq-dl-panel';
+  const DL_BTN_ID = 'fq-download-btn';
+
+  // 点击面板与下载按钮之外的区域时自动关闭面板。
+  // 关闭只移除 DOM，不影响正在进行的下载：下载循环在独立 async 函数里，
+  // 队列与状态都在其作用域内，与面板是否挂载无关。
+  let outsideClickBound = false;
+
+  function onDocumentClickForPanel(event) {
+    const panel = document.getElementById(DL_PANEL_ID);
+    if (!panel) return;
+    const target = event.target;
+    if (panel.contains(target)) return;              // 点在面板内，保持
+    if (target && target.closest && target.closest(`#${DL_BTN_ID}`)) return;  // 点在下载按钮，交给 toggle
+    closeDownloadPanel();
+  }
+
+  function bindOutsideClick() {
+    if (outsideClickBound) return;
+    outsideClickBound = true;
+    // 用捕获阶段，避免站点自己的点击处理 stopPropagation 影响。
+    document.addEventListener('click', onDocumentClickForPanel, true);
+  }
+
+  function closeDownloadPanel() {
+    const panel = document.getElementById(DL_PANEL_ID);
+    if (panel) panel.remove();
+  }
+
+  function toggleDownloadPanel() {
+    if (document.getElementById(DL_PANEL_ID)) {
+      closeDownloadPanel();
+      return;
+    }
+    const panel = document.createElement('div');
+    panel.id = DL_PANEL_ID;
+
+    const title = document.createElement('div');
+    title.className = 'fq-dl-title';
+    title.textContent = '下载';
+
+    // 下载接口选择：独立于阅读接口，默认 batch（整本下载依赖批量能力）。
+    // 下载中整行变灰不可选，避免中途切换导致前后数据来自不同接口。
+    const apiLabel = document.createElement('div');
+    apiLabel.className = 'fq-dl-label';
+    apiLabel.textContent = '下载接口';
+
+    const apiRow = document.createElement('div');
+    apiRow.className = 'fq-dl-row';
+    const apiSelect = document.createElement('select');
+    apiSelect.id = 'fq-dl-api';
+    for (const [value, text] of [['batch', 'batch_full（批量）'], ['full', 'full（单章）']]) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = text;
+      apiSelect.appendChild(option);
+    }
+    apiSelect.value = loadSettings().downloadApi;
+    apiSelect.disabled = !!downloading;
+    apiSelect.style.opacity = downloading ? '0.5' : '';
+    apiSelect.addEventListener('change', () => {
+      const settings = loadSettings();
+      saveSettings({ ...settings, downloadApi: apiSelect.value === 'full' ? 'full' : 'batch' });
+      console.log(`${LOG} 下载接口已切换为 ${apiSelect.value}`);
+    });
+    apiRow.appendChild(apiSelect);
+
+    const singleLabel = document.createElement('div');
+    singleLabel.className = 'fq-dl-label';
+    singleLabel.textContent = '单章';
+
+    const singleRow = document.createElement('div');
+    singleRow.className = 'fq-dl-row';
+    for (const [format, text] of [['txt', 'TXT'], ['md', 'Markdown']]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = text;
+      button.addEventListener('click', () => downloadSingleChapter(format));
+      singleRow.appendChild(button);
+    }
+
+    const bookLabel = document.createElement('div');
+    bookLabel.className = 'fq-dl-label';
+    bookLabel.textContent = '整本';
+
+    const bookRow = document.createElement('div');
+    bookRow.className = 'fq-dl-row';
+    for (const [format, text] of [['fb2', 'FB2'], ['epub', 'EPUB']]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = text;
+      button.addEventListener('click', () => downloadWholeBook(format));
+      bookRow.appendChild(button);
+    }
+
+    const status = document.createElement('div');
+    status.id = 'fq-dl-status';
+    status.className = 'fq-dl-status';
+    status.textContent = '';
+
+    // 取消按钮：仅下载中显示，用于中止下载。非下载状态直接隐藏。
+    const cancelRow = document.createElement('div');
+    cancelRow.className = 'fq-dl-row';
+    const cancelButton = document.createElement('button');
+    cancelButton.type = 'button';
+    cancelButton.textContent = '取消';
+    cancelButton.dataset.fqCancel = '1';
+    cancelButton.addEventListener('click', requestCancel);
+    cancelButton.hidden = !downloading;
+    cancelButton.style.display = downloading ? '' : 'none';
+    cancelRow.appendChild(cancelButton);
+
+    panel.appendChild(title);
+    panel.appendChild(apiLabel);
+    panel.appendChild(apiRow);
+    panel.appendChild(singleLabel);
+    panel.appendChild(singleRow);
+    panel.appendChild(bookLabel);
+    panel.appendChild(bookRow);
+    panel.appendChild(cancelRow);
+    panel.appendChild(status);
+    document.body.appendChild(panel);
+
+    // 面板可能在下载途中被重建（React 重渲染或手动开关），
+    // 此时按钮默认是启用态，需按当前锁状态同步一次。
+    if (downloading) {
+      setDownloadButtonsDisabled(true);
+      setDownloadStatus(`正在下载中（${downloading}），请稍候`);
+    }
+  }
+
+  // 往阅读器工具栏里插一个「下载」项，样式沿用站点已有的
+  // .reader-toolbar-item（图标 + 文字上下排列）。
+  // 注意：工具栏由 React 管理，这里只追加自建节点，绝不改动其子节点；
+  // 若被 React 重渲染移除，下一轮 run()/轮询会重新插入。
+  function ensureDownloadButton() {
+    const toolbar = document.querySelector('.reader-toolbar');
+    if (!toolbar) return false;
+    if (document.getElementById(DL_BTN_ID)) return true;
+
+    const item = document.createElement('div');
+    item.id = DL_BTN_ID;
+    item.className = 'reader-toolbar-item fq-dl-item';
+    item.innerHTML =
+      '<svg class="muyeicon-icon reader-toolbar-item-icon" width="24" height="24" viewBox="0 0 24 24" ' +
+      'fill="none" xmlns="http://www.w3.org/2000/svg">' +
+      '<path d="M12 3.75V14.25M12 14.25L8.25 10.5M12 14.25L15.75 10.5" stroke="#252525" ' +
+      'stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>' +
+      '<path d="M4.75 16.5V18.25C4.75 19.4926 5.75736 20.5 7 20.5H17C18.2426 20.5 19.25 19.4926 19.25 18.25V16.5" ' +
+      'stroke="#252525" stroke-width="1.5" stroke-linecap="round"/>' +
+      '</svg><div>下载</div>';
+    item.addEventListener('click', toggleDownloadPanel);
+    try {
+      toolbar.appendChild(item);
+    } catch (_) {
+      return false;
+    }
+    return true;
+  }
+
   // ===== 页面操作 =====
   // 约束：不得删除或改写阅读区内由 React 管理的节点。
   // 阅读器为单页应用，切章时 React 依据自身虚拟 DOM 对 <p> 与遮挡层执行
@@ -1356,9 +2268,43 @@
       }`,
       `#${PANEL_ID} .fq-switch { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }`,
       `#${PANEL_ID} .fq-switch input { margin: 0; cursor: pointer; }`,
+      // 工具栏下载项：沿用站点 .reader-toolbar-item 的排版，只补交互态。
+      `#${DL_BTN_ID} { cursor: pointer; }`,
+      `#${DL_BTN_ID}:active { opacity: 0.6; }`,
+      // 下载面板：贴在工具栏上方，与站内浮层观感一致。
+      `#${DL_PANEL_ID} {
+        position: fixed; right: 16px; bottom: 96px; z-index: 2147483000;
+        display: flex; flex-direction: column; gap: 6px;
+        padding: 10px 12px; border-radius: 8px;
+        background: rgba(255, 255, 255, 0.97);
+        border: 1px solid rgba(0, 0, 0, 0.12);
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.16);
+        font: 13px/1.5 -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        color: #333; min-width: 168px;
+      }`,
+      `#${DL_PANEL_ID} .fq-dl-title { font-weight: 600; font-size: 13px; }`,
+      `#${DL_PANEL_ID} .fq-dl-label { color: #888; font-size: 12px; margin-top: 2px; }`,
+      `#${DL_PANEL_ID} .fq-dl-row { display: flex; gap: 6px; }`,
+      `#${DL_PANEL_ID} .fq-dl-row button {
+        flex: 1; font: inherit; padding: 4px 8px; cursor: pointer;
+        border: 1px solid rgba(0, 0, 0, 0.15); border-radius: 4px;
+        background: #fff; color: #333;
+      }`,
+      `#${DL_PANEL_ID} .fq-dl-row button:hover { background: #f2f2f2; }`,
+      `#${DL_PANEL_ID} .fq-dl-row select {
+        flex: 1; font: inherit; padding: 4px 6px; cursor: pointer;
+        border: 1px solid rgba(0, 0, 0, 0.15); border-radius: 4px;
+        background: #fff; color: #333;
+      }`,
+      `#${DL_PANEL_ID} .fq-dl-row select:disabled { cursor: not-allowed; }`,
+      `#${DL_PANEL_ID} .fq-dl-status { color: #888; font-size: 11px; margin-top: 2px; word-break: break-all; }`,
       '@media (prefers-color-scheme: dark) {',
       `  #${PANEL_ID} { background: rgba(40, 40, 40, 0.94); color: #ddd; border-color: rgba(255, 255, 255, 0.15); }`,
       `  #${PANEL_ID} select { background: #2a2a2a; color: #ddd; border-color: rgba(255, 255, 255, 0.2); }`,
+      `  #${DL_PANEL_ID} { background: rgba(40, 40, 40, 0.97); color: #ddd; border-color: rgba(255, 255, 255, 0.15); }`,
+      `  #${DL_PANEL_ID} .fq-dl-row button { background: #2a2a2a; color: #ddd; border-color: rgba(255, 255, 255, 0.2); }`,
+      `  #${DL_PANEL_ID} .fq-dl-row button:hover { background: #3a3a3a; }`,
+      `  #${DL_PANEL_ID} .fq-dl-row select { background: #2a2a2a; color: #ddd; border-color: rgba(255, 255, 255, 0.2); }`,
       '}',
     ].join('\n');
     (document.head || document.documentElement).appendChild(style);
@@ -1420,6 +2366,11 @@
   let running = false;
   // 已知的下一章 ID，由上一次正文响应的 novel_data.next_item_id 得到。
   let nextChapterId = '';
+  // 当前书籍元信息，供整本下载使用；均由正文响应的 novel_data 填充。
+  let currentBookId = '';
+  let currentBookName = '';
+  let currentAuthor = '';
+  let currentCoverUrl = '';
 
   async function run() {
     const itemId = getItemId();
@@ -1462,10 +2413,18 @@
         }
       }
 
+      // 记录书籍元信息，供整本下载使用；同时把当前章存入下载缓存。
+      if (chapter.bookId) currentBookId = chapter.bookId;
+      if (chapter.bookName) currentBookName = chapter.bookName;
+      if (chapter.author) currentAuthor = chapter.author;
+      if (chapter.coverUrl) currentCoverUrl = chapter.coverUrl;
+      textCachePut({ itemId, ...chapter });
+
       ensureStyle();
       const count = renderContent(container, chapter.content);
       const removed = hidePaywall();
       ensurePanel();
+      ensureDownloadButton();
       currentItemId = itemId;
       console.log(
         `${LOG} 第 ${itemId} 章已替换（${count} 段 / ${chapter.content.length} 字符${fromCache ? '，来自预加载' : ''}）`,
@@ -1594,6 +2553,7 @@
   function boot() {
     ensureStyle();
     ensurePanel();
+    bindOutsideClick();
     run();
   }
 
@@ -1626,5 +2586,9 @@
       ensurePanel();
       run();
     }
+    // 工具栏由 React 管理，展开/收起或重渲染会移除下载项，需持续补齐。
+    ensureDownloadButton();
+    // 面板也可能随 React 重渲染消失。
+    ensurePanel();
   }, 800);
 })();
