@@ -1,7 +1,9 @@
 // ==UserScript==
 // @name         番茄小说网页阅读增强
 // @namespace    https://github.com/xyz18950377305
-// @version      0.1.0
+// @version      0.2.0
+// @updateURL    https://raw.githubusercontent.com/xyz18950377305/fanqie-web-free-reader/main/fanqie-web-free-reader.user.js
+// @downloadURL  https://raw.githubusercontent.com/xyz18950377305/fanqie-web-free-reader/main/fanqie-web-free-reader.user.js
 // @description  在番茄小说网页版直接阅读完整正文，无需安装客户端
 // @author       小宇
 // @license      MIT
@@ -24,8 +26,7 @@
  * 功能
  * ----
  * 在番茄小说网页版直接阅读完整正文，无需安装客户端，无需登录账号。
- * 网页端默认仅放出部分章节，其余章节由「扫码下载 APP」浮层遮挡；本脚本
- * 将这部分正文补齐并移除遮挡层。
+ * 网页端默认仅放出部分章节，其余章节由「扫码下载 APP」浮层遮挡；本脚本将这部分正文补齐并移除遮挡层。
  *
  * 实现原理
  * --------
@@ -41,8 +42,7 @@
  *
  * 正文接口
  * --------
- * 客户端提供两个正文接口，返回内容一致（同一章节实测逐字节相同），差异仅
- * 在于协议形态与批量能力：
+ * 客户端提供两个正文接口。
  *
  *   full
  *     https://reading.snssdk.com/reading/reader/full/v/
@@ -51,34 +51,32 @@
  *
  *   batch_full
  *     https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batch_full/v
- *     批量接口，参数 item_ids（逗号分隔，单次可达数十章）。响应为
+ *     批量接口，参数 item_ids（逗号分隔）。响应为
  *     { itemId: { content, title, novel_data, ... } } 形式。
+ *     需额外携带 book_id=0 与 req_type=1。
  *
- * 两者共用同一匿名设备身份与同一套签名头（x-argus / x-ladon / x-khronos /
- * x-ss-req-ticket）。
+ * 两者共用同一匿名设备身份与同一套签名头（x-argus / x-ladon / x-khronos / x-ss-req-ticket）。
  *
- * 请求必须携带 novel_text_type=0。该参数缺省时上游会在正文前附加
- * <h1 class="chapterTitle1"> 章节标题节点，解析时与首个段落合并为一行，
- * 表现为标题混入正文。
+ * 预加载
+ * ------
+ * 面板提供「提前加载下一章」开关（默认关闭）。开启后渲染完当前章节即取回下一
+ * 章并缓存，切章直接命中缓存，并接力预取再下一章。
  *
- * 接口可通过页面右下角的下拉框切换，切换后当前章节立即重新加载；任一接口
- * 失败时自动回退至另一接口。
+ * 下一章 ID 取自响应的 novel_data.next_item_id，两个接口都提供，无需查目录。
+ * 缓存保留最近 3 章；切换接口、关闭开关、__fanqieReset() 都会清空。
+ *
+ * 接口可通过页面右下角的下拉框切换，切换后当前章节立即重新加载；任一接口失败时自动回退至另一接口。
  *
  * 单页应用适配
  * ------------
- * 番茄阅读器为单页应用，目录跳转与上一页/下一页均不触发页面重载，故采用
- * MutationObserver 配合 URL 轮询检测章节切换。
- *
- * 关键约束：不得删除或改写阅读区内由 React 管理的节点。章节切换时 React 依
- * 据自身虚拟 DOM 执行 removeChild，若目标节点已被脚本移除，将抛出
- * NotFoundError，由 error boundary 捕获后卸载整个 #app，页面变为空白。
- * 因此脚本仅以 CSS 隐藏原始节点，正文渲染于独立创建的容器中。
+ * 番茄阅读器为单页应用，目录跳转与上一页/下一页均不触发页面重载，故采用 MutationObserver 配合 URL 轮询检测章节切换。
  *
  * 调试
  * ----
  * 油猴菜单提供「清除设备缓存（重新注册）」，等价于控制台执行 __fanqieReset()。
  * __fanqieReset()            清除设备缓存，下次运行重新注册
  * __fanqieApi('full'|'batch') 切换正文接口
+ * __fanqiePrefetch(true|false) 开关提前加载下一章
  */
 (function () {
   'use strict';
@@ -1135,11 +1133,12 @@
   }
 
   // ===== 正文 =====
-  // 两个接口返回的正文一致，差异仅在协议形态：
-  //   full   单章接口，参数 item_id，响应中正文位于 data.content
-  //   batch  批量接口，参数 item_ids，响应为 { itemId: {...} } 字典
-  // 两者均携带 novel_text_type=0：该参数缺省时上游会在正文前附加
-  // <h1 class="chapterTitle1"> 标题节点，解析后与首段合并为一行。
+  // 两个接口取回的正文逐字节相同（实测 sha256 一致），差异在请求拼装与解析路径：
+  //   full   单章，参数 item_id；正文取 data.content，标题取 data.title
+  //   batch  批量，参数 item_ids + book_id=0 + req_type=1；
+  //          响应为 { itemId: {...} } 字典，需先按 itemId 取子对象再读 content
+  // 两者均带 novel_text_type=0：实测缺省与 =1 等价，都会附加 XML 声明与
+  // <h1 class="chapterTitle1"> 标题节点；=0 才返回干净正文片段。
   // 实际使用哪个由设置决定，失败时自动回退到另一个。
 
   const FULL_URL = 'https://reading.snssdk.com/reading/reader/full/v/';
@@ -1153,9 +1152,12 @@
         ? GM_getValue(SETTINGS_KEY, null)
         : JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null');
       const saved = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      return { api: saved && saved.api === 'batch' ? 'batch' : 'full' };
+      return {
+        api: saved && saved.api === 'batch' ? 'batch' : 'full',
+        prefetch: !!(saved && saved.prefetch),
+      };
     } catch (_) {
-      return { api: 'full' };
+      return { api: 'full', prefetch: false };
     }
   }
 
@@ -1205,28 +1207,113 @@
     const data = payload.data || {};
     const content = String(data.content || '');
     if (!content) throw new Error('响应里没有正文');
-    return { title: String(data.title || ''), content: await decryptContent(content, device.secretKey) };
+    const novel = data.novel_data || {};
+    return {
+      title: String(data.title || ''),
+      content: await decryptContent(content, device.secretKey),
+      // next_item_id 供预加载定位下一章；章节末章时为空。
+      nextItemId: String(novel.next_item_id || ''),
+      bookId: String(novel.book_id || ''),
+    };
   }
 
   async function fetchByBatch(itemId, device) {
     const query = [...baseQuery(device), 'book_id=0', `item_ids=${itemId}`, 'req_type=1'].join('&');
     const payload = await requestJson(BATCH_URL, query, device);
-    const item = (payload.data || {})[itemId] || {};
+    const data = payload.data || {};
+    const item = data[itemId] || {};
     if (item.code && item.code !== 0) throw new Error(`batch 返回 ${item.code}`);
     const content = String(item.content || '');
     if (!content) throw new Error('响应里没有正文');
-    return { title: String(item.title || ''), content: await decryptContent(content, device.secretKey) };
+    const novel = item.novel_data || {};
+    return {
+      title: String(item.title || ''),
+      content: await decryptContent(content, device.secretKey),
+      nextItemId: String(novel.next_item_id || ''),
+      bookId: String(novel.book_id || ''),
+    };
+  }
+
+  // ===== 预加载 =====
+  // 读到下一章 ID 后提前取回并缓存，切章时直接命中，省掉一次往返。
+  // 两个接口的机制相同：都是拿到当前章响应、从 novel_data.next_item_id
+  // 读到下一章 ID 后，再单独发一次请求取回。请求次数一致。
+  // 注意：无法把下一章并入当前请求——该 ID 只出现在当前章的响应里。
+
+  const PREFETCH_LIMIT = 3;
+  const prefetched = new Map();
+
+  function prefetchGet(itemId) {
+    return prefetched.get(itemId) || null;
+  }
+
+  function prefetchPut(chapter) {
+    if (!chapter || !chapter.itemId || !chapter.content) return;
+    prefetched.set(chapter.itemId, chapter);
+    // 只保留最近若干章，避免长时间阅读后无限增长。
+    while (prefetched.size > PREFETCH_LIMIT) {
+      prefetched.delete(prefetched.keys().next().value);
+    }
+  }
+
+  function prefetchClear() {
+    prefetched.clear();
   }
 
   async function fetchChapter(itemId, device) {
     const settings = loadSettings();
-    const first = settings.api === 'batch' ? fetchByBatch : fetchByFull;
-    const second = settings.api === 'batch' ? fetchByFull : fetchByBatch;
+    const useBatch = settings.api === 'batch';
+    const first = useBatch ? fetchByBatch : fetchByFull;
+    const second = useBatch ? fetchByFull : fetchByBatch;
+
+    let chapter;
     try {
-      return await first(itemId, device);
+      chapter = await first(itemId, device);
     } catch (error) {
       console.warn(`${LOG} ${settings.api} 接口失败（${error.message}），改用另一个接口`);
-      return await second(itemId, device);
+      chapter = await second(itemId, device);
+    }
+
+    // 无论是否开启预加载都记录下一章 ID：这样中途打开开关时能立即预取。
+    nextChapterId = chapter.nextItemId || '';
+
+    if (settings.prefetch && nextChapterId) {
+      // 两种接口机制相同：拿到当前章响应、读到下一章 ID 后，再单独请求一次。
+      if (useBatch) prefetchOneViaBatch(nextChapterId, device);
+      else prefetchOne(nextChapterId, device);
+    }
+    return chapter;
+  }
+
+  // full 模式下单独预取下一章；失败静默，不影响当前章节显示。
+  async function prefetchOne(itemId, device) {
+    if (!itemId || prefetchGet(itemId)) return;
+    try {
+      const settings = loadSettings();
+      if (!settings.prefetch) return;
+      const chapter = await fetchByFull(itemId, device);
+      if (settings.api === 'batch') {
+        // 期间切换了接口，丢弃结果，避免与 batch 缓存混淆。
+        return;
+      }
+      prefetchPut({ itemId, ...chapter });
+      console.log(`${LOG} 已预加载第 ${itemId} 章（${chapter.content.length} 字符）`);
+    } catch (error) {
+      console.log(`${LOG} 预加载 ${itemId} 失败（${error.message}），切换时按需加载`);
+    }
+  }
+
+  // batch 模式下预取下一章：单独发一次批量请求，只带这一章。
+  async function prefetchOneViaBatch(itemId, device) {
+    if (!itemId || prefetchGet(itemId)) return;
+    try {
+      const settings = loadSettings();
+      if (!settings.prefetch || settings.api !== 'batch') return;
+      const chapter = await fetchByBatch(itemId, device);
+      prefetchPut({ itemId, ...chapter });
+      console.log(`${LOG} 已预加载第 ${itemId} 章（${chapter.content.length} 字符）`);
+    } catch (error) {
+      console.log(`${LOG} 预加载 ${itemId} 失败（${error.message}），切换时按需加载`);
     }
   }
 
@@ -1254,7 +1341,7 @@
       // 设置面板：固定在右下角，不参与正文排版。
       `#${PANEL_ID} {
         position: fixed; right: 16px; bottom: 16px; z-index: 2147483000;
-        display: flex; align-items: center; gap: 6px;
+        display: flex; flex-direction: column; gap: 4px;
         padding: 6px 10px; border-radius: 6px;
         background: rgba(255, 255, 255, 0.94);
         border: 1px solid rgba(0, 0, 0, 0.12);
@@ -1262,11 +1349,14 @@
         font: 12px/1.5 -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
         color: #333;
       }`,
+      `#${PANEL_ID} .fq-row { display: flex; align-items: center; gap: 6px; }`,
       `#${PANEL_ID} select {
         font: inherit; color: inherit; padding: 2px 4px;
         border: 1px solid rgba(0, 0, 0, 0.15); border-radius: 4px;
         background: #fff; cursor: pointer;
       }`,
+      `#${PANEL_ID} .fq-switch { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }`,
+      `#${PANEL_ID} .fq-switch input { margin: 0; cursor: pointer; }`,
       '@media (prefers-color-scheme: dark) {',
       `  #${PANEL_ID} { background: rgba(40, 40, 40, 0.94); color: #ddd; border-color: rgba(255, 255, 255, 0.15); }`,
       `  #${PANEL_ID} select { background: #2a2a2a; color: #ddd; border-color: rgba(255, 255, 255, 0.2); }`,
@@ -1329,6 +1419,8 @@
 
   let currentItemId = null;
   let running = false;
+  // 已知的下一章 ID，由上一次正文响应的 novel_data.next_item_id 得到。
+  let nextChapterId = '';
 
   async function run() {
     const itemId = getItemId();
@@ -1340,9 +1432,36 @@
     running = true;
     try {
       const device = await ensureDevice();
-      const chapter = await fetchChapter(itemId, device);
+
+      // 命中预加载缓存时无需再发请求。
+      const cached = prefetchGet(itemId);
+      let chapter;
+      let fromCache = false;
+      if (cached) {
+        chapter = cached;
+        fromCache = true;
+        prefetched.delete(itemId);
+      } else {
+        chapter = await fetchChapter(itemId, device);
+      }
+
       // 请求期间可能已切换章节，丢弃过期结果。
       if (getItemId() !== itemId) return;
+
+      // 命中缓存时不会经过 fetchChapter，需在此更新下一章并接力预取，
+      // 否则预加载链在第二次切章后断开。
+      if (fromCache) {
+        const settings = loadSettings();
+        nextChapterId = chapter.nextItemId || '';
+        if (settings.prefetch && nextChapterId) {
+          if (settings.api === 'batch') {
+            // batch 模式下用批量接口单独请求再下一章。
+            prefetchOneViaBatch(nextChapterId, device);
+          } else {
+            prefetchOne(nextChapterId, device);
+          }
+        }
+      }
 
       ensureStyle();
       const count = renderContent(container, chapter.content);
@@ -1350,7 +1469,7 @@
       ensurePanel();
       currentItemId = itemId;
       console.log(
-        `${LOG} 第 ${itemId} 章已替换（${count} 段 / ${chapter.content.length} 字符）`,
+        `${LOG} 第 ${itemId} 章已替换（${count} 段 / ${chapter.content.length} 字符${fromCache ? '，来自预加载' : ''}）`,
         chapter.title,
         removed ? `隐藏 ${removed} 个遮挡层` : '',
       );
@@ -1367,6 +1486,8 @@
   globalThis.__fanqieReset = () => {
     clearDevice();
     currentItemId = null;
+    prefetchClear();
+    nextChapterId = '';
     console.log(`${LOG} 设备缓存已清除，下次运行将重新注册`);
   };
 
@@ -1389,12 +1510,40 @@
 
   function switchApi(next) {
     const api = next === 'batch' ? 'batch' : 'full';
-    saveSettings({ api });
+    const settings = loadSettings();
+    saveSettings({ ...settings, api });
     currentItemId = null;
+    // 接口换了，旧接口取回的预加载内容不再可信。
+    prefetchClear();
+    nextChapterId = '';
     const select = document.querySelector(`#${PANEL_ID} select`);
     if (select && select.value !== api) select.value = api;
     console.log(`${LOG} 正文接口已切换为 ${api}`);
     run();
+  }
+
+  async function switchPrefetch(enabled) {
+    const settings = loadSettings();
+    saveSettings({ ...settings, prefetch: !!enabled });
+    const checkbox = document.querySelector(`#${PANEL_ID} input[type="checkbox"]`);
+    if (checkbox) checkbox.checked = !!enabled;
+    if (enabled) {
+      console.log(`${LOG} 已开启预加载`);
+      // 立即为当前章节补一次预取。nextChapterId 来自当前章的响应。
+      const next = nextChapterId;
+      if (next) {
+        try {
+          const device = await ensureDevice();
+          const now = loadSettings();
+          if (now.api === 'batch') prefetchOneViaBatch(next, device);
+          else prefetchOne(next, device);
+        } catch (_) {}
+      }
+    } else {
+      prefetchClear();
+      nextChapterId = '';
+      console.log(`${LOG} 已关闭预加载`);
+    }
   }
 
   function ensurePanel() {
@@ -1402,9 +1551,11 @@
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
 
+    // 第一行：正文接口下拉框。
+    const rowApi = document.createElement('div');
+    rowApi.className = 'fq-row';
     const label = document.createElement('span');
     label.textContent = '正文接口';
-
     const select = document.createElement('select');
     for (const [value, text] of Object.entries(API_LABELS)) {
       const option = document.createElement('option');
@@ -1414,13 +1565,31 @@
     }
     select.value = loadSettings().api;
     select.addEventListener('change', () => switchApi(select.value));
+    rowApi.appendChild(label);
+    rowApi.appendChild(select);
 
-    panel.appendChild(label);
-    panel.appendChild(select);
+    // 第二行：预加载开关。
+    const rowPrefetch = document.createElement('div');
+    rowPrefetch.className = 'fq-row';
+    const pfLabel = document.createElement('label');
+    pfLabel.className = 'fq-switch';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = !!loadSettings().prefetch;
+    checkbox.addEventListener('change', () => switchPrefetch(checkbox.checked));
+    const pfText = document.createElement('span');
+    pfText.textContent = '提前加载下一章';
+    pfLabel.appendChild(checkbox);
+    pfLabel.appendChild(pfText);
+    rowPrefetch.appendChild(pfLabel);
+
+    panel.appendChild(rowApi);
+    panel.appendChild(rowPrefetch);
     document.body.appendChild(panel);
   }
 
   globalThis.__fanqieApi = switchApi;
+  globalThis.__fanqiePrefetch = switchPrefetch;
 
   // 首屏也要有面板：run() 拿到正文后才建，若接口失败面板会缺失。
   function boot() {
