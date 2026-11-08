@@ -4,7 +4,7 @@
 // @version      0.3.0
 // @updateURL    https://raw.githubusercontent.com/xyz18950377305/fanqie-web-free-reader/main/fanqie-web-free-reader.user.js
 // @downloadURL  https://raw.githubusercontent.com/xyz18950377305/fanqie-web-free-reader/main/fanqie-web-free-reader.user.js
-// @description  在番茄小说网页版直接阅读完整正文，无需安装客户端
+// @description  在番茄小说网页版直接阅读完整正文，无需安装客户端；支持导出单章 TXT / Markdown 与整本 FB2 / EPUB
 // @author       小宇
 // @license      MIT
 // @icon         https://p1-tt.byteimg.com/origin/novel-static/a3621391ca2e537045168afda6722ee9
@@ -27,6 +27,7 @@
  * ----
  * 在番茄小说网页版直接阅读完整正文，无需安装客户端，无需登录账号。
  * 网页端默认仅放出部分章节，其余章节由「扫码下载 APP」浮层遮挡；本脚本将这部分正文补齐并移除遮挡层。
+ * 另可将正文导出为本地文件：单章 TXT / Markdown，整本 FB2 / EPUB，全部在浏览器内生成。
  *
  * 实现原理
  * --------
@@ -65,6 +66,16 @@
  * 缓存保留最近 3 章；切换接口、关闭开关、__fanqieReset() 都会清空。
  *
  * 接口可通过页面右下角的下拉框切换，切换后当前章节立即重新加载；任一接口失败时自动回退至另一接口。
+ *
+ * 下载
+ * ----
+ * 工具栏「下载」项打开独立面板：单章导出 TXT / Markdown，整本导出 FB2 / EPUB。
+ * 单章直接复用已取回的正文，不发额外请求。
+ * 整本：目录接口取章节列表，再按批请求正文。下载接口独立设置 downloadApi，默认 batch_full；
+ * batch 单次最多 30 章（超出静默截断），故按 10 章一档分批并在分片间留间隔。
+ * 失败章节翻回队尾无限重排，整轮无进展则指数退避。取消即终止，不生成残缺文件。
+ * 文件全部在浏览器内拼装：EPUB 用内置 store-only ZIP 写入器 makeZip，FB2 为单文件 XML，
+ * 封面按魔数判定类型后内嵌。下载互斥（downloading 非空即锁），同一时刻只跑一个任务。
  *
  * 单页应用适配
  * ------------
